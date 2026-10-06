@@ -1,6 +1,6 @@
 {
   "name": "dsh-voice",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "丁满语音助手：voice-engine 桥（jarvis-voice 会话）+ 状态监控/配置面板",
   "type": "module",
   "main": "lib/index.js",

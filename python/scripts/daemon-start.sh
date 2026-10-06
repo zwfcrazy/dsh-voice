@@ -13,6 +13,16 @@ export VOICE_HOME="${VOICE_HOME:-$HOME/.dsh/voice}"
 export VOICE_DAEMON_START="$(readlink -f "$0")"
 
 mkdir -p "$VOICE_HOME/logs"
+
+# 单例闸（2026-10-06 spawn 风暴教训）：daemon 冷启动要 6-10s 加载模型，期间
+# host 探活/面板轮询/自重启可能并发触发多个 launcher——5 个实例并发抢 8076。
+# flock 内核级锁随进程存亡、无陈旧问题：抢不到即静默退场，由既有探活收敛。
+exec 9>>"$VOICE_HOME/logs/daemon.lock"
+if ! flock -n 9; then
+    echo "daemon-start: 已有实例持锁，静默退出" >&2
+    exit 0
+fi
+
 export PYTHONPATH="$CODE/src${PYTHONPATH:+:$PYTHONPATH}"
 
 PY="${VOICE_PYTHON:-}"

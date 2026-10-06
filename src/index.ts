@@ -348,6 +348,12 @@ async function engineState(): Promise<any> {
 // DSH 进程在沙箱外：由 host detached spawn 的 daemon 不受 agent 会话/任务生命周期影响，
 // 且每次 dsh web 启动自愈（引擎没起 → 拉起）。
 const ENGINE_PORT = 8076
+// spawn 去抖（2026-10-06 风暴教训）：daemon 冷启动 6-10s 加载模型，boot/10s 兜底/
+// 30s 周期/面板 2s 轮询的并发探活各自拉起过 5+ 实例抢 8076。单飞 + 冷却在此层
+// 省 spawn，launcher 层 flock 单例闸做硬保证（python/scripts/daemon-start.sh）。
+const SPAWN_DEBOUNCE_MS = 15000
+let ensureInFlight = false
+let lastSpawnAt = 0
 
 async function engineAlive(): Promise<boolean> {
   const net = await import('node:net')
@@ -402,18 +408,30 @@ async function bootstrapEngine(): Promise<number> {
 
 async function ensureEngine(): Promise<void> {
   if (await engineAlive()) return
+  // spawn 去抖：单飞 + 15s 冷却（2026-10-06 风暴教训——并发探活期间 5+ 实例
+  // 抢 8076；launcher 层另有 flock 单例闸兜底，此层省掉无谓 spawn）
+  if (ensureInFlight || Date.now() - lastSpawnAt < SPAWN_DEBOUNCE_MS) return
   if (!venvReady()) {
     if (!bootstrapCooldownOk()) return
     markBootstrapAttempt()
     await bootstrapEngine()
     return
   }
-  const pid = await spawnEngine()
-  console.log('dsh-voice: 引擎未运行，已拉起 (pid=' + pid + ')')
+  ensureInFlight = true
+  try {
+    lastSpawnAt = Date.now()
+    const pid = await spawnEngine()
+    console.log('dsh-voice: 引擎未运行，已拉起 (pid=' + pid + ')')
+  } finally {
+    ensureInFlight = false
+  }
 }
 
 async function restartEngine(): Promise<number> {
-  // 注意 voice[.]daemon 方括号写法：避免 pkill -f 匹配到自身命令行
+  // 注意 voice[.]daemon 方括号写法：避免 pkill -f 匹配到自身命令行。
+  // 时间戳同步盖戳：重启后 6-10s 引擎加载窗口内挡住面板轮询探活的补位 spawn
+  // （真死透了由 15s 后的周期探活兜底）。
+  lastSpawnAt = Date.now()
   return await spawnEngine('pkill -f "voice[.]daemon" || true; sleep 1.2; exec bash ' + JSON.stringify(ENGINE_SCRIPT))
 }
 
