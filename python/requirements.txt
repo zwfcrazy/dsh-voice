@@ -1,0 +1,43 @@
+# voice-engine Python 依赖（Python 3.11，venv 实测环境整包 pin）
+# 生成: .venv/bin/pip freeze | grep -viE "^(pip|wheel|setuptools)=="
+# 开发仓 scripts/setup.sh 与 dsh-voice 包内 setup-voice.sh 共用此清单
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.3
+aiosignal==1.4.0
+attrs==26.1.0
+certifi==2026.7.22
+cffi==2.1.1
+charset-normalizer==3.5.1
+cloudpickle==3.1.2
+edge-tts @ file:///home/jarvis/dsh/project_dingman/wheels/edge_tts-7.2.8-py3-none-any.whl#sha256=298fbee095c964233652630991f641dceebffcd54173e40d4f82defe7d3d0890
+flatbuffers==25.12.19
+frozenlist==1.8.0
+idna==3.19
+joblib==1.6.0
+multidict==6.7.1
+narwhals==2.25.0
+numpy==2.4.6
+onnxruntime==1.29.0
+openwakeword==0.6.0
+packaging==26.3
+propcache==0.5.2
+protobuf==7.36.1
+pulsectl==24.12.0
+pycparser==3.0
+pypinyin==0.55.0
+requests==2.34.2
+scikit-learn==1.9.0
+scipy==1.17.1
+sherpa-onnx-core==1.13.7
+sherpa_onnx @ file:///home/jarvis/dsh/project_dingman/wheels/sherpa_onnx-1.13.7-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.whl#sha256=05e4d9b208ea08b48cd5aec0a07bc3134c6ca5091d7a3df75fe70dd326eff745
+silero-vad==6.2.1
+sounddevice==0.5.6
+tabulate==0.10.0
+ten_vad==1.0.6.8
+threadpoolctl==3.6.0
+tqdm==4.70.0
+typing_extensions==4.16.0
+urllib3==2.7.0
+webrtcvad==2.0.10
+websockets==17.1
+yarl==1.24.5

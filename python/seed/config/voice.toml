@@ -1,0 +1,125 @@
+# voice.toml（dsh-voice 种子模板——首装时拷入 VOICE_HOME/config/，已存在不覆盖）
+# 来自开发机实测调优值；音频设备已归 auto，其余按需调整。
+# 唤醒词默认「你好丁满」，换词用面板（写 keywords 文件并自重启）。
+# 注释里的"Phase N 回填"表示该段在该阶段定型
+
+[audio]
+# ---- 2026-09-13：NewPie 31 改 USB 声卡直连（BT 适配器崩溃后定型，见
+#      docs/research/phase-7a-断播排查.md）：USB 优先于蓝牙是音箱自身行为，
+#      48kHz 双向 + 自带 AEC（实测 beep 瞬态泄漏后即消），全双工无 profile 切换。
+#      蓝牙路线留档：bt_mac = "68:2B:D6:31:D8:51"（NewPie 31）/
+#      备用耳机 30:8A:F7:0A:92:06 HUAWEI FreeBuds 6i；source/sink 改回 "auto" 即回 BT。
+source = "auto"
+sink = "auto"
+
+sample_rate = 16000               # 采集规格（Phase 2 起 daemon 使用）
+channels = 1
+frame_ms = 80
+
+latency_ms = 80                    # P2-2 实测：不带此参数为 2s 突发投递，必带
+
+[vad]                              # ---- Phase 2 定型（P2-1 已确认 silero）----
+engine = "silero"                  # silero = v6 标准 ONNX，onnxruntime 直调
+threshold = 0.5
+min_speech_ms = 250                # 短于此的语音脉冲不成段（滤咔哒声）
+min_silence_ms = 1000               # 静音超过此时长才切 vad/end；面板可调 200–3000（热生效），
+                                   # 2026-09-25 用户实测定 1000（容忍说话卡壳的长停顿）
+pre_roll_ms = 200                  # 段前预留音频（Phase 4 ASR 前导音素保护）
+
+[server]                           # ---- Phase 2 定型（P2-3 已确认 websockets）----
+listen = "127.0.0.1:8076"          # 仅本机回环
+
+[ring]                             # ---- Phase 2：取证环形缓冲 ----
+seconds = 120                      # 最近 PCM（唤醒词取证/调试回放；P7a 调 HFP 断音扩到 120s）
+
+[log]
+file = "logs/voice.log"            # JSON lines
+
+[wake]                             # ---- Phase 3 定型（P3 已确认 sherpa-onnx KWS）----
+enabled = true
+model_dir = "models/sherpa-kws-wenetspeech"
+keywords_file = "keywords-dingman.txt"   # 一行拼音一词，换词改文件即可
+keyword = "卡皮巴拉"
+threshold = 0.15                    # 按词长定：四字 0.25 定点（15/15、0 误报）；三字 0.20 校准中；两字不可用
+keywords_score = 4.0               # 前缀语音抗剪枝加权（1.0 时前缀句 2/3 漏检；4.0 全中且误报 0/11）
+refractory_ms = 3000               # 命中后静默期（防一句话双触发）
+vad_gated = true                   # 仅 speech+挂起窗口内解码（CPU+误报面）
+hangover_ms = 1000                 # speech 结束后继续解码的窗口
+threads = 1                        # Pi 4 单线程足够（Phase 2 教训）
+confirm_sound = "assets/wake-confirm.wav"  # 命中提示音（paplay 到默认 sink）
+
+[asr]                             # ---- 2026-09-19 调研定型（docs/research/
+                                   # asr-upgrade-2026-09-16.md，18 句真声 A/B）----
+enabled = true
+provider = "bailian-mm"            # 同步 multimodal-generation 端点；
+                                   # bailian = 旧 qwen3 兼容路径（回退用）
+model = "qwen-audio-3.1-asr-flash" # 2026-09-25 A/B 换代（docs/research/
+                                   # qwen-audio-3.1-价格核对-2026-09-25.md）：
+                                   # p50 1094ms/宽松 4.70% 平 fun-asr（1059ms/4.30%），
+                                   # 真实错误均≈0（u04 的 df-h 是 GT 缺词反而更准）；
+                                   # 有效价约 1/10，热词+上下文增强保留。
+                                   # 弃选：fun-asr（上代定点）、qa3（p50 3-4s）、
+                                   # qwen3（丁满→今晚/丁曼、ctx 零效果）
+timeout_s = 15
+context = "语音助手对话。热词：嘿丁满、丁满、贾维斯、树莓派、Raspberry Pi、DeepSeek、Qwen、通义千问、天气。"
+                                   # input_text 上下文增强（实测有效，与 qwen3 的
+                                   # asr_options.context 不同）；最近 2 轮对话由
+                                   # provider 自动拼进（HISTORY_MAX_CHARS=1200）
+key_env = "DASHSCOPE_API_KEY"     # 值存 ~/.config/voice/secrets.env
+
+[tts]                             # ---- Phase 5 定型（P5-1/2/3/4 已确认）----
+enabled = true
+provider = "cosyvoice"            # 2026-09-15 调研后双线（docs/research/
+                                   # tts-upgrade-2026-09-15.md）：cosyvoice = 旧 WS
+                                   # （cosyvoice-*/qwen-audio-* 同协议）；
+                                   # qwen-realtime = realtime 端点会话复用，
+                                   # 首音 ~0.25s。面板「音色方案」热切。
+preset = "qa-jielidou"      # 音色方案预设（daemon TTS_PRESETS）；面板应用时
+                                   # 自动展开写 provider/model/voice 三键
+model = "qwen-audio-3.1-tts-flash"      # 2026-09-25 换代（docs/research/
+                                   # qwen-audio-3.1-价格核对）：首音/RTF 平 3.0，
+                                   # 价 ~1/6（¥0.155 vs ¥1 每万字符）；v3.6 音色被
+                                   # 3.1 拒用（引擎411），音色随换 v3.1（用户试听无区别）
+voice = "longjielidou_v3.1"             # 3.1 官方音色表版本（天真男童音不变）
+sample_rate = 24000
+timeout_s = 20
+min_sentence_chars = 40           # 2026-09-14 用户决策 v2：完整句攒批发 TTS——凑满
+                                  # 此字数（约 1-3 句）才发一批，多句一次合成韵律更连贯；
+                                  # 流停顿(sentence_idle_s)/结束兜底发出
+max_sentence_chars = 180          # 软边界保险丝（2026-09-15：1500→180）：markdown
+                                   # 咬住英文句点时半句会无限累积，曾倾泻出 72s/125s
+                                   # 音频巨批→qwen-audio 打结循环；超 180 只在自然
+                                   # 停顿标点处软切，正常批 40-90 字不受影响
+sentence_idle_s = 1.5             # 兜底：流停顿超此时长才把未满批发出（不截断）
+volume = 0.3                         # USB 模式下音箱物理音量键失效，软件定音；2026-09-25 教训：
+                                   # 恢复期 daemon 重启后回落旧值 0.3（早前面板热调未落盘），
+                                   # 已 config/set 热改+落盘修复；调音量走面板即持久化
+sink_mode = "hfp"                 # P6-1：hfp = 不切 profile 播 HFP sink（麦克风全程
+                                  # 在线，播报期间唤醒词可打断）。2025-09-13 NewPie 31
+                                  # 实测同为 profile 互斥（A2DP 与 HFP 不能同时），且 HFP
+                                  # 播放时麦克风在线、自回漏被 AEC 压制 → 维持 hfp 不变
+phrase_dir = "assets/tts-cache"   # P5-2：预合成话术目录（scripts/tts-cache.py 生成）
+key_env = "DASHSCOPE_API_KEY"
+
+[music]                             # ---- 2026-09-20 思考等待音乐：模型思考+TTS
+                                    # 合成期的空档不再静默（循环播到回复接棒）----
+enabled = true
+volume = 0.15                       # 相对满幅的比例（音乐应明显低于语音）
+file = "assets/music/thinking-loop.wav"   # 24k mono 循环素材（scripts/gen-music.py
+                                    # 生成；可换任意 mono s16 wav，自动重采样）
+
+[agent]                             # ---- Phase 7a（P7-1/P7-5 已确认）----
+session_id = "jarvis-voice"         # 固定会话 id，跨重启 resume 续聊；GUI 会话列表可见
+url = "http://127.0.0.1:3080/voice-bridge"  # DSH 插件路由（SSE 下行 + POST 上行）
+
+[loop]                             # ---- Phase 6（P6-1/2/3 已确认）----
+enabled = true
+agent = "dsh"                       # P7a 起 DSH 真后端（WS 中继→插件）；echo = 回显假后端
+woken_timeout_s = 8                # 唤醒后等首句，静默超时回 idle（判据 3）
+listening_max_s = 30               # listening 最长持续，强切回 idle（判据 3）
+think_timeout_s = 60               # agent 思考上限，超时播报"我遇到了问题"（判据 3）
+followup_window_s = 8              # P6-2：播报结束后免唤醒继续 listening 的窗口
+tool_filler = true                 # P7c 工具过渡语：tool/call 时播"我查一下哈"（面板可热关）
+tool_filler_tools = ["web_search"] # 只对慢工具播（本地快工具如 voice_volume 不播）
+echo_min_delay_s = 0.05            # EchoAgent 思考延迟区间（2026-09-13 用户反馈"响应慢"，
+echo_max_delay_s = 0.15            # 演示期取近零值；真实延迟在 Phase 7 由 agent 本身决定）

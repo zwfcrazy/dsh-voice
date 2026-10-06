@@ -1,0 +1,8 @@
+# dsh-voice bundle 补丁：语音桥 host 半区（engine WS 桥 + 面板 RPC + preset 托管）。
+# 审查补（2026-10-06）：0.2 loader 只把 entry.options.inject 并入 fiber.inject
+# （模块导出 inject 在 entry 挂载路径不生效——skills-inventory 实测教训），
+# 与模块声明保持一致，同时保证 agentPresets 就绪先于 jarvis-voice 会话 resume。
+- insert:
+    - id: dsh-voice
+      name: dsh-voice
+      inject: ['timer', 'connection', 'webServer', 'agents', 'agentDefaultModel', 'agentPresets']
