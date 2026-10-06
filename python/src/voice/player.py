@@ -443,6 +443,36 @@ class Speaker:
                  text[:20])
         return audio
 
+    async def _synth_retry(self, text: str, *, first_stream: bool, tag: str) -> bytes | None:
+        """合成重试兜底（2026-10-06 播报缺句事故）。
+
+        cosyvoice WS 握手超时等瞬时故障原本在三处消费点被"跳过"直接丢句
+        （用户听到故事中间凭空少一段）；实测该类故障秒~分钟级自愈——退避
+        重试可救回。首试可走流式（first_stream，首包延迟优先），失败后退
+        化为整段收集；打断（stop/flush）在每轮退避前检查可随时放弃。
+        全部失败返回 None（调用方跳过该句并广播 tts/error）；
+        返回 b'' 表示流式首试已写入、无需再写。"""
+        delays = (1.5, 4.0, 8.0)
+        last: Exception | None = None
+        for attempt in range(1 + len(delays)):
+            if self._stop_flag or self._flush_flag:
+                return None
+            if attempt:
+                log.warning("tts 合成重试 %d/%d（%s，退避 %.1fs后）: %s",
+                            attempt, len(delays), tag, delays[attempt - 1], last)
+                await asyncio.sleep(delays[attempt - 1])
+            try:
+                if attempt == 0 and first_stream:
+                    await self._synth_stream(text)
+                    return b""
+                return await self._synth_collect(text)
+            except Exception as e:  # noqa: BLE001
+                last = e
+        log.error("tts 合成重试耗尽（%s，跳过该句——内容丢失）: %s", tag, last)
+        await self.hub.broadcast({"type": "tts/error",
+                                  "error": f"synth retry exhausted: {last}"[:160]})
+        return None
+
     def _try_start_prefetch(self):
         """若文本队列已有下一句，立刻在后台启动其合成（一深度预取）。
 
@@ -593,7 +623,10 @@ class Speaker:
                                           "text": text})
                 await self._start_session()
                 self._last_sentence_at = time.time()
-                audio = await self._synth_collect(text)
+                audio = await self._synth_retry(text, first_stream=False, tag=f"first i={i}")
+                if audio is None:
+                    await self._teardown(self._stop_flag, total=1)
+                    continue
                 await self._write(audio)
                 # 首句在写：立刻预取下一句（若文本已到）——句 N 播放期间
                 # 句 N+1 后台合成，消除"播完才开合成"的句间空隙
@@ -611,10 +644,11 @@ class Speaker:
                         try:
                             audio = await ptask
                         except Exception as e:  # noqa: BLE001
-                            log.warning("tts 预取合成失败（跳过）: %s", e)
-                            await self.hub.broadcast({"type": "tts/error",
-                                                      "error": str(e)[:160]})
-                            continue
+                            log.warning("tts 预取合成失败，转重试: %s", e)
+                            audio = await self._synth_retry(jtext, first_stream=False,
+                                                            tag=f"prefetch i={j}")
+                            if audio is None:
+                                continue
                         gap_ms = round((time.time() - self._last_sentence_at) * 1000)
                         self._last_sentence_at = time.time()
                         log.info("tts/sentence i=%d gap=%dms(pref) %s", j, gap_ms,
@@ -653,15 +687,18 @@ class Speaker:
                              jtext[:24])
                     await self.hub.broadcast({"type": "tts/start", "i": j, "n": m,
                                               "text": jtext})
+                    audio = await self._synth_retry(jtext, first_stream=True,
+                                                    tag=f"i={j}")
+                    if audio is None:
+                        continue
                     try:
                         await self._write(b"\x00" * int(self.rate * 2 * GAP_S))
-                        await self._synth_stream(jtext)
+                        if audio:
+                            await self._write(audio)
                     except Exception as e:  # noqa: BLE001
-                        log.warning("tts 句合成失败（跳过）: %s", e)
-                        await self.hub.broadcast({"type": "tts/error",
-                                                  "error": str(e)[:160]})
-                        continue
+                        log.warning("tts 句播放失败（跳过）: %s", e)
                     session_items.append(nxt)
+                    continue
 
                 # ---- 排空管道（估算播放完所需时间；drain 后 written≈已消费，留 0.5s 管道尾量）----
                 if not self._stop_flag:
