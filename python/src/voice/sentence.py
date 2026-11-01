@@ -31,6 +31,16 @@ _SOFT = "，、；：,;:"
 # P7b 人设提示词会另行要求纯文本输出；这里是机制级兜底，批入队前调用。
 _MD_LINK = re.compile(r"\[([^\]\n]+)\]\([^)\s]*\)")       # [text](url) → text
 _MD_URL = re.compile(r"https?://[^\s，。；、！？）)】\]\"'”]+")
+# 2026-11-01 链接泄漏修复（防线二，TTS 安全网）：流式切割把链接切成两半后
+# _MD_LINK 认不出完整形态，碎片拼回成伪链接整段念出（实测 16:55 轮：
+# 「来源：[腾讯新闻](qq.com/a/20261031A02PNT00)…」入合成）。半截链接（无右
+# 括号收尾）保文本去尾巴；裸域名（无协议头）整段去掉——TLD 白名单防误伤
+# 「3.5」「v1.2」等小数/版本号（白名单不匹配即放行）。
+_MD_LINK_OPEN = re.compile(r"\[([^\]\n]{1,60})\]\([^)\s]*$")
+_MD_DOMAIN = re.compile(
+    r"(?<![A-Za-z0-9@.-])(?:[a-z0-9][a-z0-9-]*\.)+"
+    r"(?:com|cn|net|org|gov|edu|io|ai|me|tv|cc|xyz|top|site|online|shop|news|info|pro|live)"
+    r"(?:/[^\s，。；、！？）)】\]\"'”>]*)?", re.IGNORECASE)
 _MD_FENCE = re.compile(r"```[^\n`]*")                       # 围栏标记（内容保留）
 _MD_HEADING = re.compile(r"(?m)^\s{0,3}#{1,6}\s*")
 _MD_LIST = re.compile(r"(?m)^\s{0,3}([-*+]|\d{1,2}[.)])\s+")
@@ -50,6 +60,11 @@ def strip_markdown(text: str) -> str:
     t = _MD_FENCE.sub("", text or "")
     t = _MD_LINK.sub(r"\1", t)
     t = _MD_URL.sub("", t)
+    t = _MD_LINK_OPEN.sub(r"\1", t)     # 半截链接（流式切割漏网）：留文本
+    t = _MD_DOMAIN.sub("", t)           # 裸域名/无协议链接：整段去掉
+    t = re.sub(r"\(\)|（）\[\]", "", t)  # 链接剥除后的空壳括号
+    t = re.sub(r"[ \t]+([，。；、！？：）)】\]\"'”])", r"\1", t)  # 剥除残迹：标点前空格
+    t = re.sub(r"([\（(\[【「“])[ \t]+", r"\1", t)               # 开括号后空格
     t = _MD_HEADING.sub("", t)
     t = _MD_LIST.sub("", t)
     t = _MD_QUOTE.sub("", t)

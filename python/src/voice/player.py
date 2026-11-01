@@ -376,8 +376,12 @@ class Speaker:
         s = self._stream_buf.rstrip()
         if s and s[-1] in "。！？!?；;…":
             return True
-        # 英文句点（排除小数 "3."）：句尾立即闭合，不必等下一批 token
-        if len(s) >= 2 and s[-1] == "." and not s[-2].isdigit():
+        # 英文句点（排除小数 "3."）：句尾立即闭合，不必等下一批 token。
+        # 2026-11-01 链接泄漏修复：句点前是 ASCII 字母/数字（域名内部
+        # view.inews. / www. / qq.com.）不算句末——曾在 chunk 边界把链接
+        # 从中间放行，strip 认不出半截链接，碎片拼回后整段念出。英文
+        # 句子尾巴同理晚切，由 idle flush 兜底（语音回复以中文为主）。
+        if len(s) >= 2 and s[-1] == "." and not (s[-2].isascii() and s[-2].isalnum()):
             return True
         return False
 
