@@ -325,23 +325,35 @@ class Speaker:
         log.info("tts/idle-arm buf=%dbatch=%d",
                  len(self._stream_buf), sum(len(s) for s in self.batcher._buf))
 
-    def _idle_flush_now(self) -> None:
+    def flush_pending(self, why: str) -> int:
+        """立即冲刷流式缓冲：半句过软边界 + 未满批全部入队（不动 _streaming）。
+
+        两个消费方：idle 超时兜底（_idle_flush_now）；工具过渡冲刷
+        （loop._on_tool——模型前置文本顶替固定过渡语，须立刻可播而不
+        等攒批/idle 计时）。返回入队批数。
+        """
         self._idle_handle = None
-        if not self._streaming:
-            log.info("tts/idle-flush 跳过（非流式）")
-            return
         tail = strip_markdown(self._stream_buf)
         self._stream_buf = ""
         if tail:
             # 残段也要过软边界：长尾在逗号处切开，防巨批倾泻
             self.batcher.add(split_sentences(tail, self.max_chars))
-        batches = self.batcher.flush()
-        if not batches:
-            log.info("tts/idle-flush 空（缓冲已被清空——stop() 嫌疑）")
-        for batch in batches:
+        n = 0
+        for batch in self.batcher.flush():
             self._stream_idx += 1
             self.queue.put_nowait((self._stream_idx, 0, batch))
-            log.info("tts/idle-flush %dchars", len(batch))
+            log.info("tts/%s %dchars", why, len(batch))
+            n += 1
+        return n
+
+    def _idle_flush_now(self) -> None:
+        if not self._streaming:
+            self._idle_handle = None
+            log.info("tts/idle-flush 跳过（非流式）")
+            return
+        n = self.flush_pending("idle-flush")
+        if n == 0:
+            log.info("tts/idle-flush 空（缓冲已被清空——stop() 嫌疑）")
 
     async def stream_end(self) -> int:
         """流结束：残余半句 + 未满批全部发出，会话收尾交回 worker。"""

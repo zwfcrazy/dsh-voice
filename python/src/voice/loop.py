@@ -154,6 +154,7 @@ class VoiceLoop:
         self.tool_filler = bool(lc.get("tool_filler", True))
         self.tool_filler_tools = {str(x) for x in (lc.get("tool_filler_tools") or ["web_search"])}
         self._tool_filled = False          # 每轮只播一次
+        self._turn_reply_chars = 0         # 本轮已到达的模型文本量（前置文本替代固定过渡语的判据）
         # 唤醒词前缀剥离用（2026-09-25：动态跟随面板换词，见 strip_wake_prefix）
         self.wake_keyword = str((cfg.get("wake") or {}).get("keyword") or "").strip()
 
@@ -351,6 +352,7 @@ class VoiceLoop:
         self._to(THINKING, "asr-ok")
         self._arm("thinking", self.think_timeout_s)
         self._tool_filled = False               # 过渡语：每轮重置（P7c）
+        self._turn_reply_chars = 0
         asyncio.ensure_future(self.speaker.music_start())   # 思考期垫乐（2026-09-20）
         if self.asr is not None:
             try:
@@ -374,7 +376,42 @@ class VoiceLoop:
     def _ev_tts_done(self) -> None:
         if self.state != SPEAKING:
             return
-        self._metrics["speak_done_ts"] = time.time()
+        if (self._agent_task is not None and not self._agent_task.done()
+                and not self._idle_after_speak):
+            # 工具间隙收尾（2026-11-01 断链修复）：worker 3s 流式空闲拆了
+            # 播放会话，但 agent 流仍在（工具执行中/后文未到）——本轮远未
+            # 结束。旧版在此结算 turn 进 followup，工具后的回复文本因状态
+            # 已非 live 被静默丢弃（实测天气轮：前置语播完即"断链"，垫乐
+            # 也一去不回）。改为回 thinking 等后文：垫乐补位、thinking 超
+            # 时兜底；后续句的 tts/start 自然回 speaking 接着播。
+            log.info("tts/done 中途收尾：agent 流仍在，回 thinking 等后文（工具间隙）")
+            self._to(THINKING, "tool-wait")
+            self._arm("thinking", self.think_timeout_s)
+            asyncio.ensure_future(self._music_after_toolwait())
+            return
+        self._finish_reply_turn()
+
+    async def _music_after_toolwait(self) -> None:
+        """tool-wait 垫乐补位：等 worker 收尾（拆会话/清 busy）后再开，
+        避开 music_start 的 worker_busy 早退竞速；一次重试兜底。"""
+        for delay in (0.3, 1.2):
+            await asyncio.sleep(delay)
+            if self.state != THINKING or self.speaker._music_on:
+                return
+            try:
+                await self.speaker.music_start()
+            except Exception as e:  # noqa: BLE001
+                log.warning("tool-wait 垫乐启动失败（忽略）: %s", e)
+            if self.speaker._music_on:
+                return
+
+    def _finish_reply_turn(self) -> None:
+        """回复轮正常收尾：结算 turn + followup 窗（或错误播报回 idle）。
+
+        tts/done 事件收尾与 tool-wait 流尽收尾（_agent_run）共用，
+        保证每轮恰好一条 turn/end。
+        """
+        self._metrics["speak_done_ts"] = self._metrics.get("speak_done_ts") or time.time()
         self._end_turn(self._outcome_override or "ok")
         self._outcome_override = ""
         if self._idle_after_speak:
@@ -401,14 +438,24 @@ class VoiceLoop:
     # ---------- agent 会话 ----------
 
     def _on_tool(self, name: str) -> None:
-        """工具过渡语（P7c）：桥转发的 tool/call。thinking 态、本轮首次、
-        白名单工具才播；本地缓存话术走 beep 管道（worker 串行，与回复音频
-        天然排队；_write 会自动让位垫乐）。失败静默——过渡语是锦上添花。"""
-        if not self.tool_filler or self._tool_filled or self.state != THINKING:
+        """工具过渡语（P7c v2：模型前置文本优先）。桥转发的 tool/call；
+        白名单慢工具、本轮首次才介入。模型已说过渡文本（哪怕还在攒批
+        未播）→ 冲刷缓冲让其立即顶上，替代固定话术（2026-11-01 用户
+        决策：模型原话比固定"我查一下哈"自然，且避免双份过渡语叠播）；
+        无前置文本才回退预合成话术（beep 管道，worker 串行；_write 自动
+        让位垫乐）。失败静默——过渡语是锦上添花。"""
+        if not self.tool_filler or self._tool_filled:
             return
         if name not in self.tool_filler_tools:
             return
         self._tool_filled = True
+        if self._turn_reply_chars > 0:
+            log.info("过渡语替代：模型前置文本 %d 字冲刷顶上 name=%s",
+                     self._turn_reply_chars, name)
+            self.speaker.flush_pending("tool-flush")
+            return
+        if self.state != THINKING:
+            return
         log.info("过渡语触发 name=%s（诊断）", name)
         asyncio.ensure_future(self._speak_tool_filler())
 
@@ -437,6 +484,7 @@ class VoiceLoop:
                     self._metrics["reply_first_ts"] = time.time()
                     first = False
                 reply_buf.append(chunk)
+                self._turn_reply_chars += len(chunk)
                 await self.speaker.stream_feed(chunk)
             if self.asr is not None and reply_buf:
                 try:
@@ -450,7 +498,13 @@ class VoiceLoop:
                 await self.speaker.stream_end()
                 self._to(IDLE, "agent-empty")
                 return
-            await self.speaker.stream_end()       # 残句入队；tts/* 事件驱动后续
+            n_tail = await self.speaker.stream_end()   # 残句入队；tts/* 事件驱动后续
+            if n_tail == 0 and self.state == THINKING:
+                # tool-wait 中流已尽（工具后无更多文本）：不会再有 tts 事件
+                # 收尾，自行结算（否则空挂到 thinking 超时误报）。有尾批则
+                # worker 的 tts/start→speaking、tts/done 走正常事件收尾。
+                log.info("tool-wait 流尽收尾：工具后无文本，本轮自行结算")
+                self._finish_reply_turn()
         except asyncio.CancelledError:
             try:
                 await self.speaker.flush()        # 丢弃未播残留
