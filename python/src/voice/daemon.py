@@ -126,6 +126,7 @@ class Daemon:
         self._watch_stall_s = 0.0
         self._last_level_sent = 0.0
         self._level_dbfs = -96.0
+        self._seg_wake_hit = False     # P9-1：段级唤醒命中标记（对照组留证用）
 
         a = cfg["audio"]
         v = cfg["vad"]
@@ -729,6 +730,12 @@ class Daemon:
 
     def _on_seg_end(self, t_mono: float, ts_wall: float, dur_ms: float, pcm: bytes) -> None:
         log.info("vad/end dur=%.0fms bytes=%d", dur_ms, len(pcm))
+        # P9-1 对照组：本段内 KWS 命中过 → 存 hit-*.wav（与 miss-* 同目录
+        # 同清理；留证带放宽到 8s——连说"唤醒词+指令"的一口气段也算命中样本）
+        if (self.miss_capture and self._seg_wake_hit
+                and 0.8 <= dur_ms / 1000 <= 8.0):
+            self._capture_miss(pcm, dur_ms, ts_wall, hit=True)
+        self._seg_wake_hit = False
         # 段边界重置 KWS 解码流（对抗束剪枝漏检，见 kws.reset 注释）
         self.kws.reset()
         asyncio.ensure_future(self.hub.broadcast({
@@ -763,12 +770,17 @@ class Daemon:
         finally:
             self._asr_pending = False
 
-    def _capture_miss(self, pcm: bytes, dur_ms: float, ts_wall: float) -> None:
-        """P9-1：闲时未唤醒段 wav 落盘（16k/mono/s16，含段前预卷）。"""
+    def _capture_miss(self, pcm: bytes, dur_ms: float, ts_wall: float,
+                      hit: bool = False) -> None:
+        """P9-1：闲时未唤醒段 wav 落盘（16k/mono/s16，含段前预卷）。
+
+        hit=True 为对照组（段内 KWS 命中，hit- 前缀）；两者同目录同清理。
+        """
         import wave as _wave
         try:
             self.miss_dir.mkdir(parents=True, exist_ok=True)
-            name = (time.strftime("%Y%m%d-%H%M%S", time.localtime(ts_wall))
+            name = (("hit-" if hit else "miss-")
+                    + time.strftime("%Y%m%d-%H%M%S", time.localtime(ts_wall))
                     + f"-{int(dur_ms)}ms.wav")
             path = self.miss_dir / name
             with _wave.open(str(path), "wb") as wv:
@@ -778,17 +790,20 @@ class Daemon:
                 wv.writeframes(pcm)
             x = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
             seg_db = 20 * np.log10(float(np.sqrt(np.mean(x ** 2))) + 1e-9)
-            log.info("wake/miss-captured file=%s dur=%.0fms rms=%.1fdbfs",
+            log.info("wake/%s file=%s dur=%.0fms rms=%.1fdbfs",
+                     "hit-captured" if hit else "miss-captured",
                      name, dur_ms, seg_db)
             self._prune_miss()
         except Exception as e:  # noqa: BLE001
             log.warning("wake/miss-capture 失败: %s", e)
 
     def _prune_miss(self) -> None:
-        """留证清理：超龄或超量删最旧（4000 段上限 ≈ 8 天用量）。"""
+        """留证清理：超龄或超量删最旧（hit-/miss- 共享额度，4000 段 ≈ 8 天）。"""
         try:
-            files = sorted(self.miss_dir.glob("miss-*.wav"),
-                           key=lambda f: f.stat().st_mtime, reverse=True)
+            files = sorted(
+                (f for f in self.miss_dir.glob("*.wav")
+                 if f.name.startswith(("miss-", "hit-"))),
+                key=lambda f: f.stat().st_mtime, reverse=True)
             cutoff = time.time() - self.miss_keep_hours * 3600
             doomed = [f for f in files if f.stat().st_mtime < cutoff]
             doomed += files[self.miss_keep_files:]
@@ -898,6 +913,7 @@ class Daemon:
         self.kws.note_speech(speech)
         keyword = self.kws.feed(frame)
         if keyword:
+            self._seg_wake_hit = True   # P9-1 对照组：本段含唤醒命中
             self._on_wake(keyword)
         self.seg.feed(speech, frame, time.monotonic(), time.time())
         now = time.monotonic()
