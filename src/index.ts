@@ -27,7 +27,11 @@ export const inject = ['timer', 'connection', 'webServer', 'agents', 'agentDefau
 
 const SESSION = 'jarvis-voice'
 const PREFIX = '/voice-bridge'
-const ENGINE_WS = 'ws://127.0.0.1:8076'
+// 引擎 WS 端口可配（2026-11-01 双实例开发环境）：默认 8076 与引擎
+// voice.toml server.listen 对齐；开发实例整链换端口（DSH_VOICE_ENGINE_PORT
+// + VOICE_HOME 独立 + voice.toml listen），生产不受影响。
+const ENGINE_PORT = Number(process.env.DSH_VOICE_ENGINE_PORT || 8076)
+const ENGINE_WS = `ws://127.0.0.1:${ENGINE_PORT}`
 const CLEAR_PENDING = ARCHIVE_ROOT + '/CLEAR-PENDING'
 
 let handle: any = undefined
@@ -347,7 +351,7 @@ async function engineState(): Promise<any> {
 // ---------- 引擎生命周期托管 ----------
 // DSH 进程在沙箱外：由 host detached spawn 的 daemon 不受 agent 会话/任务生命周期影响，
 // 且每次 dsh web 启动自愈（引擎没起 → 拉起）。
-const ENGINE_PORT = 8076
+// ENGINE_PORT 定义在文件头（DSH_VOICE_ENGINE_PORT 可配，双实例开发用）。
 // spawn 去抖（2026-10-06 风暴教训）：daemon 冷启动 6-10s 加载模型，boot/10s 兜底/
 // 30s 周期/面板 2s 轮询的并发探活各自拉起过 5+ 实例抢 8076。单飞 + 冷却在此层
 // 省 spawn，launcher 层 flock 单例闸做硬保证（python/scripts/daemon-start.sh）。

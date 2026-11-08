@@ -20,7 +20,9 @@ import type { Context } from '@deepseek-ai/cordis'
 export const name = 'dsh-voice-tools'
 export const inject: string[] = ['tools', 'systemPrompt']
 
-const ENGINE_WS = 'ws://127.0.0.1:8076'
+// 引擎 WS 端口可配（与 index.ts 同款：DSH_VOICE_ENGINE_PORT，双实例开发用）
+const ENGINE_PORT = Number(process.env.DSH_VOICE_ENGINE_PORT || 8076)
+const ENGINE_WS = `ws://127.0.0.1:${ENGINE_PORT}`
 
 /** resolve+import(URL) 装载 defineTool（锚点与 dsh-voice importCompactionBasic 一致）。 */
 async function loadDefineTool(): Promise<any> {
