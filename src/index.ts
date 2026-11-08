@@ -348,6 +348,12 @@ async function engineState(): Promise<any> {
   catch (e: any) { return { offline: true, error: String((e && e.message) || e) } }
 }
 
+/** P8-3（2026-11-08）：TCP 通 ≠ 活着。ping RPC 带超时探"真活"——
+ * 抓进程在、端口监听但事件循环卡死的假死形态（旧探活只防"死透"）。 */
+async function engineHealthy(): Promise<boolean> {
+  try { await engineCall('ping', {}, 3000); return true } catch (e) { return false }
+}
+
 // ---------- 引擎生命周期托管 ----------
 // DSH 进程在沙箱外：由 host detached spawn 的 daemon 不受 agent 会话/任务生命周期影响，
 // 且每次 dsh web 启动自愈（引擎没起 → 拉起）。
@@ -358,6 +364,7 @@ async function engineState(): Promise<any> {
 const SPAWN_DEBOUNCE_MS = 15000
 let ensureInFlight = false
 let lastSpawnAt = 0
+let hungStrikes = 0   // P8-3 假死计票：连续无应答次数（30s 探活一轮）
 
 async function engineAlive(): Promise<boolean> {
   const net = await import('node:net')
@@ -425,7 +432,21 @@ async function ensureEngine(): Promise<void> {
     }
     return
   }
-  if (await engineAlive()) return
+  if (await engineAlive()) {
+    // P8-3：TCP 在还要 RPC 应答。连续 2 轮（约 60s）ping 超时才判假死重启，
+    // 单次超时只记票不动作——重负载期（TTS 合成/模型推理）防误杀。
+    if (await engineHealthy()) { hungStrikes = 0; return }
+    hungStrikes++
+    if (hungStrikes >= 2) {
+      console.warn(`dsh-voice: 引擎假死（ping 连续 ${hungStrikes} 轮超时，TCP 仍在监听），自动重启`)
+      hungStrikes = 0
+      await restartEngine()
+    } else {
+      console.warn('dsh-voice: 引擎 ping 无应答（第 1 轮，下轮复查后再动作）')
+    }
+    return
+  }
+  hungStrikes = 0
   // spawn 去抖：单飞 + 15s 冷却（2026-10-06 风暴教训——并发探活期间 5+ 实例
   // 抢 8076；launcher 层另有 flock 单例闸兜底，此层省掉无谓 spawn）
   if (ensureInFlight || Date.now() - lastSpawnAt < SPAWN_DEBOUNCE_MS) return
@@ -447,11 +468,19 @@ async function ensureEngine(): Promise<void> {
 
 async function restartEngine(): Promise<number> {
   if (!ENGINE_SUPPORTED) return -1   // 非 Linux：引擎未托管（ensureEngine 已说明）
-  // 注意 voice[.]daemon 方括号写法：避免 pkill -f 匹配到自身命令行。
   // 时间戳同步盖戳：重启后 6-10s 引擎加载窗口内挡住面板轮询探活的补位 spawn
   // （真死透了由 15s 后的周期探活兜底）。
   lastSpawnAt = Date.now()
-  return await spawnEngine('pkill -f "voice[.]daemon" || true; sleep 1.2; exec bash ' + JSON.stringify(ENGINE_SCRIPT))
+  // 2026-11-08 双实例修正：旧版 pkill -f voice.daemon 无差别匹配，dev 实例
+  // 重启会顺带杀掉生产引擎（同机 cmdline 相同）。改为按 VOICE_HOME 环境变量
+  // 逐个比对 /proc/<pid>/environ 只杀本实例；补 CONT 让 SIGSTOP 假死进程的
+  // SIGTERM 可送达（挂起态信号保持 pending 直到恢复调度）。
+  const scopedKill = [
+    "for p in $(pgrep -f 'voice[.]daemon'); do",
+    "  tr '\\0' '\\n' < /proc/$p/environ 2>/dev/null | grep -qxF \"VOICE_HOME=$VOICE_HOME\" && { kill $p; kill -CONT $p; }",
+    'done; true',
+  ].join(' ')
+  return await spawnEngine(scopedKill + '; sleep 1.2; exec bash ' + JSON.stringify(ENGINE_SCRIPT))
 }
 
 // ---------- jarvis-voice 上下文管理（压缩/清空 + 调度） ----------

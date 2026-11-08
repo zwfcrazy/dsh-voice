@@ -71,7 +71,12 @@ def setup_logging(logfile: Path) -> None:
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     logfile.parent.mkdir(parents=True, exist_ok=True)
-    fh = logging.FileHandler(logfile, encoding="utf-8")
+    # P8-2（2026-11-08）：轮转替代裸 FileHandler——voice.log 曾无限增长到
+    # 610MB（vad/kws 高频行每天几十 MB，SD 卡有填满风险）。50MB×3 份，
+    # 顺带给 metrics-report.py 一个稳定的解析窗口（当天 + 回溯 2 份）。
+    from logging.handlers import RotatingFileHandler
+    fh = RotatingFileHandler(
+        logfile, encoding="utf-8", maxBytes=50 * 1024 * 1024, backupCount=3)
     fh.setFormatter(JsonFormatter())
     sh = logging.StreamHandler(sys.stderr)
     sh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s", "%H:%M:%S"))
