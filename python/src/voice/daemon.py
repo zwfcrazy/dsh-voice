@@ -136,6 +136,15 @@ class Daemon:
             frame_ms=a["frame_ms"])
         self.seg.on_start = self._on_seg_start
         self.seg.on_end = self._on_seg_end
+        # P9-1 漏检留证（2026-11-08 决策：只落盘不送云，一周后回看）
+        w = cfg.get("wake", {})
+        self.miss_capture = bool(w.get("miss_capture", False))
+        band = w.get("miss_band", [0.8, 2.5])
+        self.miss_band = (float(band[0]), float(band[1]))
+        _md = Path(w.get("miss_capture_dir", "forensics/wake-miss"))
+        self.miss_dir = _md if _md.is_absolute() else REPO_ROOT / _md
+        self.miss_keep_files = int(w.get("miss_keep_files", 4000))
+        self.miss_keep_hours = float(w.get("miss_keep_hours", 192))
         r = cfg["ring"]
         self.ring = RingBuffer(r["seconds"], a["sample_rate"], a["channels"])
         self.kws = KwsEngine(cfg)
@@ -741,12 +750,54 @@ class Daemon:
         try:
             await asyncio.sleep(0)
             if self.voiceloop is not None and not self.voiceloop.wants_asr():
+                # P9-1 漏检留证：闲时段（loop 仍 idle = KWS 没中）按留证带
+                # 落盘，供离线 KWS 得分扫描 / 人工 ASR 打标。不送云。
+                if (self.miss_capture and self.kws.enabled
+                        and self.voiceloop.state == "idle"
+                        and self.miss_band[0] <= dur_ms / 1000 <= self.miss_band[1]):
+                    self._capture_miss(pcm, dur_ms, ts_wall)
                 log.info("asr skip（loop=%s，段 %dms 不在对话中）",
                          self.voiceloop.state, dur_ms)
                 return
             await self._asr_task(pcm, dur_ms, ts_wall)
         finally:
             self._asr_pending = False
+
+    def _capture_miss(self, pcm: bytes, dur_ms: float, ts_wall: float) -> None:
+        """P9-1：闲时未唤醒段 wav 落盘（16k/mono/s16，含段前预卷）。"""
+        import wave as _wave
+        try:
+            self.miss_dir.mkdir(parents=True, exist_ok=True)
+            name = (time.strftime("%Y%m%d-%H%M%S", time.localtime(ts_wall))
+                    + f"-{int(dur_ms)}ms.wav")
+            path = self.miss_dir / name
+            with _wave.open(str(path), "wb") as wv:
+                wv.setnchannels(1)
+                wv.setsampwidth(2)
+                wv.setframerate(16000)
+                wv.writeframes(pcm)
+            x = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+            seg_db = 20 * np.log10(float(np.sqrt(np.mean(x ** 2))) + 1e-9)
+            log.info("wake/miss-captured file=%s dur=%.0fms rms=%.1fdbfs",
+                     name, dur_ms, seg_db)
+            self._prune_miss()
+        except Exception as e:  # noqa: BLE001
+            log.warning("wake/miss-capture 失败: %s", e)
+
+    def _prune_miss(self) -> None:
+        """留证清理：超龄或超量删最旧（4000 段上限 ≈ 8 天用量）。"""
+        try:
+            files = sorted(self.miss_dir.glob("miss-*.wav"),
+                           key=lambda f: f.stat().st_mtime, reverse=True)
+            cutoff = time.time() - self.miss_keep_hours * 3600
+            doomed = [f for f in files if f.stat().st_mtime < cutoff]
+            doomed += files[self.miss_keep_files:]
+            for f in dict.fromkeys(doomed):
+                f.unlink(missing_ok=True)
+            if doomed:
+                log.info("wake/miss-pruned %d 个留证文件", len(doomed))
+        except Exception as e:  # noqa: BLE001
+            log.warning("wake/miss-prune 失败: %s", e)
 
     def _asr_once(self, pcm: bytes):
         """单次 ASR（执行器线程）：DNS 瞬断重试一次（Errno -3 实测重试即恢复）。"""
