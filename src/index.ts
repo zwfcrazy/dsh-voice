@@ -410,7 +410,21 @@ async function bootstrapEngine(): Promise<number> {
   return child.pid ?? -1
 }
 
+// 平台守卫（2026-11-08 跨机同步安全）：语音引擎依赖 PipeWire/pw-cat/flock，
+// 仅支持 Linux。package.json os 字段让 pnpm 在 Windows/macOS 直接拒绝安装
+// （config 同步导入降级为非致命警告）；此处运行时兜底防 --force 强装——
+// 无 bash 的 Windows 上 spawn ENOENT 的异步 error 无人监听会崩掉 host。
+const ENGINE_SUPPORTED = process.platform === 'linux'
+let engineUnsupportedLogged = false
+
 async function ensureEngine(): Promise<void> {
+  if (!ENGINE_SUPPORTED) {
+    if (!engineUnsupportedLogged) {
+      engineUnsupportedLogged = true
+      console.log('dsh-voice: 语音引擎仅支持 Linux（本机 ' + process.platform + '），跳过引擎托管')
+    }
+    return
+  }
   if (await engineAlive()) return
   // spawn 去抖：单飞 + 15s 冷却（2026-10-06 风暴教训——并发探活期间 5+ 实例
   // 抢 8076；launcher 层另有 flock 单例闸兜底，此层省掉无谓 spawn）
@@ -432,6 +446,7 @@ async function ensureEngine(): Promise<void> {
 }
 
 async function restartEngine(): Promise<number> {
+  if (!ENGINE_SUPPORTED) return -1   // 非 Linux：引擎未托管（ensureEngine 已说明）
   // 注意 voice[.]daemon 方括号写法：避免 pkill -f 匹配到自身命令行。
   // 时间戳同步盖戳：重启后 6-10s 引擎加载窗口内挡住面板轮询探活的补位 spawn
   // （真死透了由 15s 后的周期探活兜底）。
